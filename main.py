@@ -85,23 +85,34 @@ class DataEngine:
             return False
 
     def get_user_interactions(self, user_id: str):
-        """Fetch and weight user interactions from DB."""
+        """Fetch and weight user interactions from the new UserFeedAnalytics collection."""
         try:
             uid = ObjectId(user_id)
             weighted_interests = {}
 
-            # A. Likes, Shares
-            actions = self.db["UserFeedActions"].find_one({"userId": uid})
-            if actions:
-                for item in actions.get("likedFeeds", []):
-                    self._add_weight(weighted_interests, item["feed_id"], WEIGHTS["like"])
-                for item in actions.get("sharedFeeds", []):
-                    self._add_weight(weighted_interests, item["feed_id"], WEIGHTS["share"])
+            # New Analytics Model
+            analytics = self.db["UserFeedAnalytics"].find({"userId": uid})
+            
+            for entry in analytics:
+                feed_id = str(entry["feedId"])
+                weight = 0
+                
+                # Align with Node.js weights
+                if entry.get("liked"): weight += 3
+                if entry.get("saved"): weight += 2
+                if entry.get("shared"): weight += 2
+                if entry.get("commented"): weight += 1
+                
+                # Watch time weight (e.g., 1 point per 10 seconds, max 5)
+                watch_time = entry.get("watchTime", 0)
+                weight += min(watch_time // 10, 5)
+                
+                # Penalties
+                if entry.get("skipped"): weight -= 2
+                if entry.get("notInterested"): weight -= 10
 
-            # B. Watch Time
-            video_views = self.db["UserVideoView"].find({"userId": uid, "watchedSeconds": {"$gt": 20}})
-            for view in video_views:
-                self._add_weight(weighted_interests, view["videoId"], WEIGHTS["watch_20s"])
+                if weight != 0:
+                    self._add_weight(weighted_interests, feed_id, weight)
 
             return weighted_interests
         except Exception as e:
@@ -255,4 +266,4 @@ async def manual_refresh():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
