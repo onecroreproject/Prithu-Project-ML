@@ -11,6 +11,7 @@ from typing import List, Optional
 import asyncio
 from datetime import datetime, timedelta
 import logging
+import redis
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +37,15 @@ WEIGHTS = {
     "comment": 6
 }
 
+# Redis Config
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+try:
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+except Exception as e:
+    logger.warning(f"Redis connection failed: {e}")
+    redis_client = None
+
 # ----------------------------------------
 # DATA ENGINE
 # ----------------------------------------
@@ -56,7 +66,7 @@ class DataEngine:
             feeds_cursor = feeds_col.find(
                 {"isApproved": True, "isDeleted": False},
                 {"_id": 1, "category": 1, "postType": 1, "caption": 1, "hashtags": 1}
-            ).sort("createdAt", -1).limit(1000)
+            ).sort("createdAt", -1).limit(5000)
             
             feeds_list = []
             for f in feeds_cursor:
@@ -102,6 +112,10 @@ class DataEngine:
                 if entry.get("saved"): weight += 2
                 if entry.get("shared"): weight += 2
                 if entry.get("commented"): weight += 1
+                
+                # Clicks weight (0.5 points per click, max 5)
+                clicks = entry.get("clickCount", 0)
+                weight += min(clicks * 0.5, 5)
                 
                 # Watch time weight (e.g., 1 point per 10 seconds, max 5)
                 watch_time = entry.get("watchTime", 0)
@@ -168,7 +182,19 @@ async def get_recommendations(
             logger.warning(f"All feeds excluded for user {user_id}. Returning subset of original.")
             valid_df = engine.feeds_df.sample(min(limit, len(engine.feeds_df)))
 
-        recommendations = []
+        reco_map = {}
+
+        def add_to_recos(fid, cat, score, reason):
+            """Optimized helper to add recommendations and keep highest score (O(1))."""
+            fid_str = str(fid)
+            if fid_str not in reco_map or score > reco_map[fid_str]["score"]:
+                reco_map[fid_str] = {
+                    "feed_id": fid_str,
+                    "category": cat,
+                    "score": round(float(score), 2),
+                    "reason": reason
+                }
+
         pers_limit = int(limit * 0.7)
         
         # --- 1. Personalized (Similarity + Interests) ---
@@ -178,75 +204,72 @@ async def get_recommendations(
             if not idx_matches.empty:
                 idx = idx_matches[0]
                 sim_scores = list(enumerate(engine.similarity[idx]))
-                # Sort and filter by valid_df
                 sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
                 
                 added_count = 0
                 for i, score in sim_scores:
                     row = engine.feeds_df.iloc[i]
                     if row["feed_id"] in valid_df["feed_id"].values and row["feed_id"] != feed_id:
-                        recommendations.append({
-                            "feed_id": row["feed_id"],
-                            "category": row["category"],
-                            "score": round(float(score), 2),
-                            "reason": f"Similar content in {row['category']}"
-                        })
+                        add_to_recos(row["feed_id"], row["category"], score, f"Similar content in {row['category']}")
                         added_count += 1
                         if added_count >= pers_limit: break
 
         # B. Interest-based
-        if len(recommendations) < pers_limit:
+        if len(reco_map) < pers_limit:
             interests = engine.get_user_interactions(user_id)
             if interests:
                 top_cats = sorted(interests.items(), key=lambda x: x[1], reverse=True)
                 for cat, _ in top_cats[:3]:
                     cat_feeds = valid_df[valid_df["category"] == cat]
                     if not cat_feeds.empty:
-                        samples = cat_feeds.sample(min(len(cat_feeds), 3))
+                        samples = cat_feeds.sample(min(len(cat_feeds), 5))
                         for _, row in samples.iterrows():
-                            if row["feed_id"] not in [r["feed_id"] for r in recommendations]:
-                                recommendations.append({
-                                    "feed_id": row["feed_id"],
-                                    "category": row["category"],
-                                    "score": 0.85,
-                                    "reason": f"Matched your interest in {cat}"
-                                })
-                            if len(recommendations) >= pers_limit: break
-                    if len(recommendations) >= pers_limit: break
+                            add_to_recos(row["feed_id"], row["category"], 0.85, f"Matched your interest in {cat}")
+                            if len(reco_map) >= pers_limit: break
+                    if len(reco_map) >= pers_limit: break
 
         # --- 2. Trending (20%) ---
         trend_limit = max(1, int(limit * 0.2))
-        trending_pool = valid_df[~valid_df["feed_id"].isin([r["feed_id"] for r in recommendations])]
+        trending_pool = valid_df[~valid_df["feed_id"].isin(reco_map.keys())]
         if not trending_pool.empty:
             trending = trending_pool.sample(min(trend_limit, len(trending_pool)))
             for _, row in trending.iterrows():
-                recommendations.append({
-                    "feed_id": row["feed_id"],
-                    "category": row["category"],
-                    "score": 0.90,
-                    "reason": "Trending now"
-                })
+                add_to_recos(row["feed_id"], row["category"], 0.90, "Trending now")
 
         # --- 3. Exploration (10%) ---
-        exp_limit = max(1, limit - len(recommendations))
-        remaining_pool = valid_df[~valid_df["feed_id"].isin([r["feed_id"] for r in recommendations])]
+        exp_limit = max(1, limit - len(reco_map))
+        remaining_pool = valid_df[~valid_df["feed_id"].isin(reco_map.keys())]
         if not remaining_pool.empty:
             discovery = remaining_pool.sample(min(exp_limit, len(remaining_pool)))
             for _, row in discovery.iterrows():
-                recommendations.append({
-                    "feed_id": row["feed_id"],
-                    "category": row["category"],
-                    "score": 0.50,
-                    "reason": "Discover something new"
-                })
+                add_to_recos(row["feed_id"], row["category"], 0.50, "Discover something new")
+
+        # Convert map to list
+        recommendations = list(reco_map.values())
 
         # Apply Diversity Filter (Max 5 per category)
         final_recos = apply_diversity_filter(recommendations, max_per_cat=5)
         
+        # --- GLOBAL CLEANUP & REFILL ---
+        # If diversity filter removed too many, fill back to limit with unique feeds
+        if len(final_recos) < limit:
+            existing_ids = {r["feed_id"] for r in final_recos}
+            fill_pool = valid_df[~valid_df["feed_id"].isin(existing_ids)]
+            if not fill_pool.empty:
+                fill_count = min(limit - len(final_recos), len(fill_pool))
+                fill_samples = fill_pool.sample(fill_count)
+                for _, row in fill_samples.iterrows():
+                    final_recos.append({
+                        "feed_id": row["feed_id"],
+                        "category": row["category"],
+                        "score": 0.40,
+                        "reason": "Popular recommendation"
+                    })
+
         # Final shuffle for discovery feel
         random.shuffle(final_recos)
 
-        logger.info(f"Recommended {len(final_recos)} feeds for user {user_id} (Excluded: {len(exclude_ids)})")
+        logger.info(f"Recommended {len(final_recos)} feeds for user {user_id} (Deduplicated with scores preserved)")
 
         return {
             "user_id": user_id,
