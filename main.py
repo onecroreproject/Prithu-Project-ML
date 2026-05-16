@@ -133,6 +133,36 @@ class DataEngine:
             logger.error(f"Error fetching interactions for {user_id}: {e}")
             return {}
 
+    def get_collaborative_recos(self, user_id: str, exclude_ids: List[str]):
+        """Collaborative Filtering: Suggest feeds liked by users with similar taste."""
+        try:
+            uid = ObjectId(user_id)
+            # 1. Get current user's top categories
+            user_interests = self.get_user_interactions(user_id)
+            if not user_interests: return []
+            
+            top_cats = sorted(user_interests.items(), key=lambda x: x[1], reverse=True)[:2]
+            top_cat_ids = [cat for cat, _ in top_cats]
+
+            # 2. Find other users who like these categories
+            similar_users_analytics = self.db["UserFeedAnalytics"].find({
+                "userId": { "$ne": uid },
+                "liked": True,
+                "feedId": { "$nin": [ObjectId(eid) for eid in exclude_ids if ObjectId.is_valid(eid)] }
+            }).limit(100)
+
+            reco_feeds = {}
+            for entry in similar_users_analytics:
+                fid = str(entry["feedId"])
+                reco_feeds[fid] = reco_feeds.get(fid, 0) + 1
+
+            # 3. Sort by popularity among similar users
+            sorted_recos = sorted(reco_feeds.items(), key=lambda x: x[1], reverse=True)
+            return sorted_recos[:10]
+        except Exception as e:
+            logger.error(f"Collaborative Filtering Error: {e}")
+            return []
+
     def _add_weight(self, interests, feed_id, weight):
         feed_row = self.feeds_df[self.feeds_df["feed_id"] == str(feed_id)]
         if not feed_row.empty:
@@ -195,7 +225,11 @@ async def get_recommendations(
                     "reason": reason
                 }
 
-        pers_limit = int(limit * 0.7)
+        # Ratios: 60% Personal, 15% Collaborative, 15% Trending, 10% Exploration
+        pers_limit = int(limit * 0.60)
+        collab_limit = int(limit * 0.15)
+        trend_limit = int(limit * 0.15)
+        exp_limit = limit - (pers_limit + collab_limit + trend_limit)
         
         # --- 1. Personalized (Similarity + Interests) ---
         # A. Similarity-based
@@ -228,16 +262,23 @@ async def get_recommendations(
                             if len(reco_map) >= pers_limit: break
                     if len(reco_map) >= pers_limit: break
 
-        # --- 2. Trending (20%) ---
-        trend_limit = max(1, int(limit * 0.2))
+        # --- 2. Collaborative Filtering (15%) ---
+        if collab_limit > 0:
+            collab_recos = engine.get_collaborative_recos(user_id, exclude_ids)
+            for fid, count in collab_recos:
+                feed_row = engine.feeds_df[engine.feeds_df["feed_id"] == fid]
+                if not feed_row.empty:
+                    add_to_recos(fid, feed_row.iloc[0]["category"], 0.88, "Users with similar taste liked this")
+                    if len(reco_map) >= (pers_limit + collab_limit): break
+
+        # --- 3. Trending (15%) ---
         trending_pool = valid_df[~valid_df["feed_id"].isin(reco_map.keys())]
         if not trending_pool.empty:
             trending = trending_pool.sample(min(trend_limit, len(trending_pool)))
             for _, row in trending.iterrows():
                 add_to_recos(row["feed_id"], row["category"], 0.90, "Trending now")
 
-        # --- 3. Exploration (10%) ---
-        exp_limit = max(1, limit - len(reco_map))
+        # --- 4. Exploration / Discovery (10%) ---
         remaining_pool = valid_df[~valid_df["feed_id"].isin(reco_map.keys())]
         if not remaining_pool.empty:
             discovery = remaining_pool.sample(min(exp_limit, len(remaining_pool)))
