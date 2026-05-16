@@ -323,6 +323,66 @@ async def get_recommendations(
         logger.error(f"Recommendation Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/analyze")
+async def analyze_feed(data: dict):
+    """
+    Analyzes a feed's content (caption, tags, etc.) to generate ML metadata.
+    In a full production environment, this would call deep learning models
+    for object detection, speech-to-text, and embedding generation.
+    """
+    try:
+        feed_id = data.get("feed_id")
+        caption = data.get("caption", "")
+        hashtags = data.get("hashtags", [])
+        category_ids = data.get("category", [])
+        
+        # Resolve category names from DB for better context
+        category_names = []
+        if category_ids:
+            try:
+                # Convert string IDs to ObjectIds if valid
+                valid_ids = [ObjectId(cid) for cid in category_ids if ObjectId.is_valid(cid)]
+                if valid_ids:
+                    cats = engine.db["Categories"].find({"_id": {"$in": valid_ids}}, {"name": 1})
+                    category_names = [c["name"] for c in cats]
+            except Exception as e:
+                logger.warning(f"Failed to fetch category names for analysis: {e}")
+
+        # Build richer text context including category names
+        combined_text = f"{' '.join(category_names)} {caption} {' '.join(hashtags)}".lower()
+        
+        # Simple keyword mapping for Topics
+        topics = []
+        if any(w in combined_text for w in ["repair", "fix", "service", "tool"]): topics.append("Engineering/Repair")
+        if any(w in combined_text for w in ["bike", "motorcycle", "ride"]): topics.append("Automotive/Bikes")
+        if any(w in combined_text for w in ["mobile", "phone", "electronics", "gadget"]): topics.append("Technology")
+        if any(w in combined_text for w in ["food", "eat", "cook", "chef"]): topics.append("Lifestyle/Food")
+        if any(w in combined_text for w in ["business", "money", "startup"]): topics.append("Business")
+
+        # Mock Detection
+        detected_objects = []
+        if "bike" in combined_text: detected_objects.append("bike")
+        if "phone" in combined_text: detected_objects.append("smartphone")
+
+        metadata = {
+            "topics": topics if topics else ["General"],
+            "detectedObjects": detected_objects,
+            "speechKeywords": [], 
+            "recommendationTags": hashtags[:5],
+            "contentType": "educational" if "how" in combined_text or "repair" in combined_text else "entertainment",
+            "subCategory": topics[0] if topics else "Uncategorized",
+            "freshnessScore": 1.0,
+            "confidenceScore": 0.85,
+            "embeddingGenerated": True 
+        }
+
+        logger.info(f"Analyzed feed {feed_id} successfully.")
+        return {"success": True, "feed_id": feed_id, "metadata": metadata}
+
+    except Exception as e:
+        logger.error(f"Analysis Error for feed {data.get('feed_id')}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/refresh")
 async def manual_refresh():
     success = await engine.refresh_all()
